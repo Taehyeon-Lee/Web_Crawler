@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+
+import socket
+import ssl
+import html.parser
+import sys
+from queue import Queue
+
+ROOT_URL = "https://project2.5700.network"
+HOSTNAME = "project2.5700.network"
+PORT = 443
+
+
+# create a standard socket
+def createSocket(host, port):
+    try:
+        return socket.create_connection((host, port))
+    except Exception:
+        # retry
+        createSocket(host, port)
+
+
+# SSL wrap socket
+def wrapSocketSSL(s, host):
+    try:
+        context = ssl.create_default_context()
+        return context.wrap_socket(s, server_hostname=host)
+    except Exception:
+        # retry
+        wrapSocketSSL(s, host)
+
+
+# find a message's body length
+def find_content_len(m):
+    try:
+        lines = m.split()
+        if "Content-Length:" in lines:
+            index = lines.index("Content-Length:")
+            return lines[index + 1]
+    except Exception:
+        exit("An error was encountered while determining the length of the message body.")
+
+
+# receive a response from the server
+def receive_response(s):
+    try:
+        message = s.recv(4096).decode()
+        len = find_content_len(message)
+        while True:
+            if len == "0":
+                break
+            elif message.endswith("</html>\n"):
+                break
+            else:
+                message += s.recv(4096).decode()
+
+        return message
+
+    except Exception:
+        exit("An error was encountered while receiving a message from the server. Check the socket and server status")
+
+
+# run on first server contact, now have session id and status code
+def initiate_server_contact(sock):
+    line1 = "GET / HTTP/1.1\n"
+    line2 = "Host: " + HOSTNAME
+    req = line1 + line2 + "\r\n\r\n"
+
+    sock.sendall(req.encode())
+    response = receive_response(sock)
+    return response
+
+
+# run on second server contact, now have csrf token to be able to log in
+def complete_cookie_requirement(sock, sID):
+    line1 = "GET /accounts/login/ HTTP/1.1\n"
+    line2 = "Host: " + HOSTNAME + "\n"
+    line3 = "Referer: " + ROOT_URL + "/\n"
+    line4 = "Connection: keep-alive\n"
+    line5 = "Cookie: " + "sessionid=" + sID + "\n"
+    req = line1 + line2 + line3 + line4 + line5 + "\r\n\r\n"
+    sock.sendall(req.encode())
+    response = receive_response(sock)
+    return response
+
+
+# finds the HTTP status code from the server response
+def find_HTTP_status_code(res):
+    try:
+        start = res.index(" ") + 1
+        end = start + 4
+        return res[start:end]
+    except Exception:
+        print("PROB RESPONSE: " + res)
+
+
+# parses response (before log in) and returns dict with:
+# HTTP status, sessionID cookie and CSRF Token cookie
+def parse_response_before_logged_in(res):
+    lines = res.split("\n")
+
+    # find status code
+    resultData = {"statusCode": find_HTTP_status_code(res)}
+
+    # find cookies
+    for i, line in enumerate(lines):
+        if line.startswith("Set-Cookie"):
+            cookieLine = line.split(" ")
+            for cL in cookieLine:
+                if cL.startswith("sessionid"):
+                    sessionID = cL[10:-1]
+                    resultData["sessionID"] = sessionID
+                if cL.lower().startswith("csrftoken"):
+                    csrfToken = cL[10:-1]
+                    resultData["csrfToken"] = csrfToken
+
+    return resultData
+
+
+# generates and sends a POST request to log in the user
+def loginUser(sock, sid, csrf, middleware, user, pw):
+    bodyLine = "username=" + user + "&password=" + pw + "&csrfmiddlewaretoken=" + middleware + "&next="
+    bodySize = len(bodyLine)
+
+    line1 = "POST /accounts/login/ HTTP/1.1\n"
+    line2 = "Host: " + HOSTNAME + "\n"
+    line3 = "Referer: " + ROOT_URL + "/\n"
+    line4 = "Content-Type: application/x-www-form-urlencoded\n"
+    line5 = "Connection: keep-alive\n"
+    line6 = "Content-Length: " + str(bodySize) + "\n"
+    line7 = "Cookie: " + "sessionid=" + sid + "; csrftoken=" + csrf + "\n\n"
+    req = line1 + line2 + line3 + line4 + line5 + line6 + line7 + bodyLine + "\r\n\r\n"
+
+    sock.sendall(req.encode())
+    response = receive_response(sock)
+    return response
+
+
+# sent on all subsequent requests after the user is logged in
+def logged_in_GET_request(sock, sid, csrf, url_suffix):
+    line1 = f"GET /{url_suffix} HTTP/1.1\n"
+    line2 = "Host: " + HOSTNAME + "\n"
+    line3 = "Referer: " + ROOT_URL + "/\n"
+    line4 = "Connection: keep-alive\n"
+    line5 = f"Cookie: csrftoken={csrf}; sessionid={sid}\n"
+    req = line1 + line2 + line3 + line4 + line5 + "\r\n\r\n"
+    sock.sendall(req.encode())
+    response = receive_response(sock)
+    return response
+
+
+# parses a 301 response code for the new url
+def parse301(res):
+    lines = res.split()
+    if "Location:" in lines:
+        index = lines.index("Location:")
+        full = lines[index + 1]
+        if "project2.5700.network" in full:
+            fakebook_start = full.index("fakebook")
+            return full[fakebook_start:]
+        return full
+
+
+# parses html for tokens, secret tags, and <a> tag urls
+class MyHTMLParser(html.parser.HTMLParser):
+
+    def __init__(self):
+        self.csrfmiddlewaretoken = ""
+        self.secret_flag_set = set()
+        self.url_queue = Queue(maxsize=sys.maxsize)
+        self.already_visited_set = set()
+        self.found_flag = False
+        super().__init__()
+
+    def handle_starttag(self, tag, attrs):
+        # finds csrfmiddlewaretoken
+        if tag == 'input':
+            attrs = dict(attrs)
+            if 'name' in attrs and attrs['name'] == 'csrfmiddlewaretoken':
+                self.csrfmiddlewaretoken = attrs['value']
+        # finds additional links
+        if tag == 'a':
+            attrs = dict(attrs)
+            if attrs['href'].startswith('/fakebook'):
+                self.url_queue.put(attrs['href'][1:])
+        # check for presence of secret flag
+        if tag == 'h2':
+            attrs = dict(attrs)
+            if 'class' in attrs and attrs['class'] == 'secret_flag':
+                self.found_flag = True
+
+    def handle_data(self, data):
+        # finds secret keys
+        if self.found_flag:
+            flag_val = data[6:]
+            self.secret_flag_set.add(flag_val)
+            self.found_flag = False
+
+
+# ******************************** program entry point *************************
+if __name__ == "__main__":
+    # create socket
+    sock = createSocket(HOSTNAME, PORT)
+    # wrap socket - SSL
+    sockSSL = wrapSocketSSL(sock, HOSTNAME)
+
+    # initiate server contact
+    response = initiate_server_contact(sockSSL)
+    # get session ID cookie
+    http_level_data = parse_response_before_logged_in(response)
+    sessionID = http_level_data['sessionID']
+
+    # request csrf token for login
+    response = complete_cookie_requirement(sockSSL, sessionID)
+    # get csrf token along with status code and session ID
+    http_level_data = parse_response_before_logged_in(response)
+    csrfToken = http_level_data['csrfToken']
+
+    # search html for csrf middleware token
+    parser = MyHTMLParser()
+    parser.feed(response)
+    middlewareToken = parser.csrfmiddlewaretoken
+
+    # parse CLI args for username and password
+    username = sys.argv[-2]
+    password = sys.argv[-1]
+
+    # send POST to login
+    response = loginUser(sockSSL, sessionID, csrfToken, middlewareToken, username, password)
+    http_level_data = parse_response_before_logged_in(response)
+
+    # update cookies for logged in session
+    try:
+        csrfToken = http_level_data['csrfToken']
+        sessionID = http_level_data['sessionID']
+    except Exception:
+        exit("Invalid username or password provided. Exiting...")
+
+    # send GET request to homepage with logged in session cookies
+    response = logged_in_GET_request(sockSSL, sessionID, csrfToken, "")
+
+    # parse html for all links
+    parser.feed(response)
+
+    # begin crawling urls
+    while not parser.url_queue.empty():
+        # grab a url from the queue
+        next_url = parser.url_queue.get()
+
+        # skip already visited urls
+        if next_url in parser.already_visited_set:
+            continue
+
+        # send get request to the url
+        response = logged_in_GET_request(sockSSL, sessionID, csrfToken, next_url)
+
+        # take the response html and search for flags
+        status_code = find_HTTP_status_code(response)
+
+        if status_code == '200':
+            # 200 - all good
+            pass
+        if status_code == '301':
+            try:
+                # 301 - grab the updated url
+                newUrl = parse301(response)
+                # add new url to queue
+                parser.url_queue.put(newUrl)
+                # add old url to already visited set and continue
+                parser.already_visited_set.add(next_url)
+            except Exception:
+                parser.url_queue.put(next_url)
+            continue
+        if status_code == '302':
+            # 302 - auto redirect
+            pass
+        if status_code == '403' or status_code == '404':
+            # 403 or 404 - abandon
+            parser.already_visited_set.add(next_url)
+            continue
+        if status_code.startswith("5"):
+            # 5** - repeat
+            parser.url_queue.put(next_url)
+            continue
+
+        # grab all links in the html and add to queue
+        # ALSO** check that root of URL is within the site - aka not external
+        parser.feed(response)
+
+        # add the url to a 'already visited' set
+        parser.already_visited_set.add(next_url)
+
+        # end crawling once we find 5 flags
+        if len(parser.secret_flag_set) == 5:
+            break
+
+    # print all flags found
+    for flag in parser.secret_flag_set:
+        print(flag)
+
+    # close socket
+    sockSSL.close()
